@@ -14,7 +14,7 @@ This repo is **self-contained** — the steps below run audiobookshelf **by hand
 
 ## Run it without orca
 
-### Docker / Podman
+### Docker Compose
 
 ```yaml
 # compose.yml
@@ -35,7 +35,24 @@ services:
 docker compose up -d
 ```
 
-Podman: the same file with `podman-compose up -d`.
+### Other runtimes
+
+**Podman** — the compose above works with `podman compose up -d`, or run it directly:
+
+```sh
+podman run -d --name audiobookshelf --restart unless-stopped \
+    -p 13378:80/tcp \
+    -v ./config:/config \
+    -v ./metadata:/metadata \
+    -v /path/to/audiobooks:/audiobooks \
+    ghcr.io/advplyr/audiobookshelf:latest
+```
+
+**LXC** — on a container-capable LXC (e.g. a Proxmox LXC with nesting enabled) run the same image via Docker/Podman as above, or install audiobookshelf from upstream directly on the guest: <https://www.audiobookshelf.org/>.
+
+**VM** — install audiobookshelf from upstream (<https://www.audiobookshelf.org/>) or run the same container image inside the VM; expose port `13378`.
+
+**Unraid** — add via *Community Applications*, or *Docker → Add Container* with image `ghcr.io/advplyr/audiobookshelf:latest`, port `13378`, and the volume paths above.
 
 ### Ports & data
 
