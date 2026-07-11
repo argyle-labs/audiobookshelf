@@ -1,0 +1,24 @@
+# Audiobookshelf - Audiobooks and Podcasts
+# docs: ../../docs/services/audiobookshelf.md
+
+services:
+  audiobookshelf:
+    container_name: audiobookshelf
+    image: ghcr.io/advplyr/audiobookshelf:${AUDIOBOOKSHELF_IMAGE_TAG:-latest}
+    environment:
+      - TZ=${TZ:-America/Denver}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    ports:
+      - "${AUDIOBOOKSHELF_PORT:-13378}:80"
+    volumes:
+      - ${AUDIOBOOKSHELF_CONFIG_PATH:-/opt/appdata/audiobookshelf}:/config
+      - ${AUDIOBOOKSHELF_METADATA_PATH:-/opt/appdata/audiobookshelf/metadata}:/metadata
+      - ${MEDIA_PATH:-/mnt/pool/data/media}/audiobooks:/data/media/audiobooks
+      - ${MEDIA_PATH:-/mnt/pool/data/media}/podcasts:/data/media/podcasts
+      - ${MEDIA_PATH:-/mnt/pool/data/media}/books:/data/media/books
+    restart: unless-stopped
