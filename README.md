@@ -75,10 +75,13 @@ orca drives this plugin through the single generic `service.*` surface — no pe
 
 ```sh
 orca service.deploy audiobookshelf      # render + launch on any supported runtime
-orca service.status audiobookshelf      # health + rich diagnostics (typed payload)
 orca service.backup audiobookshelf      # location-agnostic backup (tar; PBS on Proxmox)
-orca service.configure audiobookshelf   # apply config via the upstream API
 ```
+
+> **Not yet implemented (planned):** `service.status` (health + rich diagnostics)
+> and `service.configure` (apply config via the upstream API) are part of the
+> service-backend contract but are currently stubbed in this plugin — both return
+> an "unimplemented" error until the descriptor lands them.
 
 ## Layout
 
