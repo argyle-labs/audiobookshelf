@@ -2,15 +2,13 @@
 
 Audiobooks and podcasts server with progress tracking.
 
-- **Host**: <host> (<ip>)
 - **Port**: 13378 (configurable via `AUDIOBOOKSHELF_PORT`)
 - **Image**: `ghcr.io/advplyr/audiobookshelf`
-- **Compose**: [compose/audiobookshelf/](../../compose/audiobookshelf/docker-compose.yml)
+- **Compose**: [compose.yml](../compose.yml)
 
 ## Deploy
 
 ```bash
-cd compose/audiobookshelf
 docker compose up -d
 ```
 
