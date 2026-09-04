@@ -95,7 +95,12 @@ impl ServiceBackend for AudiobookshelfBackend {
 // credentials) for device setup from ONE place. See orca#408 / #404.
 
 use plugin_toolkit::clap; // the endpoint_resource! tools emit unqualified `clap::` paths
-use plugin_toolkit::media::{Capability, MediaBackend, MediaError, MediaType, MediaUrl};
+use plugin_toolkit::http::{Client as HttpClient, Response};
+use plugin_toolkit::media::{
+    Capability, MediaBackend, MediaError, MediaIdentity, MediaType, MediaUnit, MediaUrl, SeriesRef,
+    Source, SourceKind,
+};
+use plugin_toolkit::serde;
 
 /// Endpoint registry for the audiobookshelf server orca talks to: `(base_url,
 /// token)` keyed by `name`. `endpoint_resource!` emits the row struct, the
@@ -135,11 +140,11 @@ impl MediaBackend for AbsMedia {
     fn media_type(&self) -> MediaType {
         self.media_type
     }
-    /// A server that hands out a reachable URL for device setup. `credentials`
-    /// (per-user, orca-managed) lands with the served_by credential brokerage
-    /// (orca#406); `units` with the library-view slice (orca#408 follow-up).
+    /// A server that hands out a reachable URL + a converged library view.
+    /// `credentials` (per-user, orca-managed) lands with the served_by credential
+    /// brokerage (orca#406).
     fn capabilities(&self) -> Vec<Capability> {
-        vec![Capability::ServedBy, Capability::Url]
+        vec![Capability::ServedBy, Capability::Url, Capability::Units]
     }
     /// Built at startup (outside the capability sink), so this must not touch the
     /// db — the real reachable URL is resolved lazily in [`url`](Self::url).
@@ -151,17 +156,198 @@ impl MediaBackend for AbsMedia {
     /// Runs inside an `Invoke` (cap sink active), so the `endpoint_db` read is
     /// valid here. `media served-by --media-type audiobooks` returns this URL.
     async fn url(&self) -> Result<MediaUrl, MediaError> {
+        let cfg = self.resolve_config()?;
+        Ok(MediaUrl {
+            primary: cfg.base_url,
+            alternates: Vec::new(),
+        })
+    }
+
+    /// This backend's partial convergence view: every library item Audiobookshelf
+    /// serves for this media type, as a [`MediaUnit`] carrying its identity
+    /// (title + series + ASIN/ISBN external ids, normalized via the media
+    /// identity helpers) and an `AppStream` source pointing at the item. Core
+    /// merges these with other backends' views (see `media.unit-list`).
+    async fn units(&self) -> Result<Vec<MediaUnit>, MediaError> {
+        let cfg = self.resolve_config()?;
+        // ABS library mediaType is "book" or "podcast".
+        let want = match self.media_type {
+            MediaType::Audiobooks => "book",
+            MediaType::Podcasts => "podcast",
+            _ => return Ok(Vec::new()),
+        };
+        let client = AbsClient::new(&cfg);
+        let mut units = Vec::new();
+        for lib in client
+            .libraries()
+            .await?
+            .into_iter()
+            .filter(|l| l.media_type == want)
+        {
+            for item in client.library_items(&lib.id).await? {
+                let md = item.media.metadata;
+                let Some(title) = md.title.filter(|t| !t.is_empty()) else {
+                    continue;
+                };
+                let mut identity = MediaIdentity {
+                    title,
+                    year: None,
+                    external_ids: Vec::new(),
+                    series: md.series_name.map(|name| SeriesRef {
+                        name,
+                        sequence: None,
+                    }),
+                };
+                if let Some(asin) = md.asin.filter(|s| !s.is_empty()) {
+                    identity = identity.with_external_id("asin", &asin, self.media_type);
+                }
+                if let Some(isbn) = md.isbn.filter(|s| !s.is_empty()) {
+                    identity = identity.with_external_id("isbn", &isbn, self.media_type);
+                }
+                units.push(MediaUnit {
+                    media_type: self.media_type,
+                    identity,
+                    variants: Vec::new(),
+                    sources: vec![Source {
+                        method: SourceKind::AppStream,
+                        by: "audiobookshelf".to_string(),
+                        url: Some(format!(
+                            "{}/item/{}",
+                            cfg.base_url.trim_end_matches('/'),
+                            item.id
+                        )),
+                    }],
+                });
+            }
+        }
+        Ok(units)
+    }
+}
+
+impl AbsMedia {
+    /// Load the first enabled configured endpoint as an [`AbsConfig`]. The
+    /// `endpoint_db` read is only valid inside an `Invoke` (cap sink active), so
+    /// this is called from the async verbs, never from `endpoint()`.
+    fn resolve_config(&self) -> Result<AbsConfig, MediaError> {
         let rows = endpoint_db::list()
             .map_err(|e| MediaError::Transport(format!("read endpoints: {e}")))?;
         let ep = rows
             .into_iter()
             .find(|r| r.enabled)
             .ok_or_else(|| MediaError::NotFound("no enabled audiobookshelf endpoint".into()))?;
-        Ok(MediaUrl {
-            primary: ep.base_url,
-            alternates: Vec::new(),
+        Ok(AbsConfig {
+            base_url: ep.base_url,
+            token: ep.token,
         })
     }
+}
+
+// ── Audiobookshelf HTTP client (library view) ────────────────────────────────
+
+/// Resolved connection to one Audiobookshelf server.
+struct AbsConfig {
+    base_url: String,
+    token: String,
+}
+
+/// Minimal Audiobookshelf API client: Bearer-token GET + JSON decode, enough for
+/// the `units()` library view. Grows request-by-request as more verbs land.
+struct AbsClient<'a> {
+    cfg: &'a AbsConfig,
+    http: HttpClient,
+}
+
+impl<'a> AbsClient<'a> {
+    fn new(cfg: &'a AbsConfig) -> Self {
+        Self {
+            cfg,
+            http: HttpClient::new(),
+        }
+    }
+
+    async fn get(&self, path: &str) -> Result<Response, MediaError> {
+        self.http
+            .get(format!(
+                "{}{}",
+                self.cfg.base_url.trim_end_matches('/'),
+                path
+            ))
+            .header("authorization", format!("Bearer {}", self.cfg.token))
+            .header("accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| MediaError::Transport(format!("GET {path}: {e}")))
+    }
+
+    async fn libraries(&self) -> Result<Vec<AbsLibrary>, MediaError> {
+        let resp = self.get("/api/libraries").await?;
+        Ok(resp
+            .json::<LibrariesResp>()
+            .map_err(|e| MediaError::Transport(format!("decode libraries: {e}")))?
+            .libraries)
+    }
+
+    async fn library_items(&self, library_id: &str) -> Result<Vec<AbsItem>, MediaError> {
+        let resp = self
+            .get(&format!("/api/libraries/{library_id}/items"))
+            .await?;
+        Ok(resp
+            .json::<ItemsResp>()
+            .map_err(|e| MediaError::Transport(format!("decode items: {e}")))?
+            .results)
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+struct LibrariesResp {
+    #[serde(default)]
+    libraries: Vec<AbsLibrary>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+struct AbsLibrary {
+    #[serde(default)]
+    id: String,
+    #[serde(default, rename = "mediaType")]
+    media_type: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+struct ItemsResp {
+    #[serde(default)]
+    results: Vec<AbsItem>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+struct AbsItem {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    media: AbsItemMedia,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(crate = "plugin_toolkit::serde")]
+struct AbsItemMedia {
+    #[serde(default)]
+    metadata: AbsMetadata,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(crate = "plugin_toolkit::serde")]
+struct AbsMetadata {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    asin: Option<String>,
+    #[serde(default)]
+    isbn: Option<String>,
+    #[serde(default, rename = "seriesName")]
+    series_name: Option<String>,
 }
 
 #[cfg(test)]
@@ -175,11 +361,37 @@ mod tests {
     }
 
     #[test]
-    fn media_facet_is_a_served_by_url_backend() {
+    fn media_facet_advertises_served_by_url_and_units() {
         let m = AbsMedia::served(MediaType::Audiobooks);
         assert_eq!(m.name(), "audiobookshelf");
         assert_eq!(m.media_type(), MediaType::Audiobooks);
-        assert!(m.capabilities().contains(&Capability::ServedBy));
-        assert!(m.capabilities().contains(&Capability::Url));
+        for cap in [Capability::ServedBy, Capability::Url, Capability::Units] {
+            assert!(m.capabilities().contains(&cap), "missing {cap:?}");
+        }
+    }
+
+    // Pins the ABS `/api/libraries/{id}/items` JSON shape this backend maps from —
+    // a rename (`mediaType`, `seriesName`) or nesting change breaks the units view.
+    #[test]
+    fn abs_item_json_decodes_the_metadata_fields() {
+        let raw = plugin_toolkit::serde_json::json!({
+            "results": [{
+                "id": "li_abc",
+                "media": { "metadata": {
+                    "title": "The Way of Kings",
+                    "asin": "B0041JKFJW",
+                    "isbn": null,
+                    "seriesName": "The Stormlight Archive"
+                }}
+            }]
+        });
+        let parsed: ItemsResp = plugin_toolkit::serde_json::from_value(raw).unwrap();
+        assert_eq!(parsed.results.len(), 1);
+        let md = &parsed.results[0].media.metadata;
+        assert_eq!(md.title.as_deref(), Some("The Way of Kings"));
+        assert_eq!(md.asin.as_deref(), Some("B0041JKFJW"));
+        assert_eq!(md.isbn, None);
+        assert_eq!(md.series_name.as_deref(), Some("The Stormlight Archive"));
+        assert_eq!(parsed.results[0].id, "li_abc");
     }
 }
