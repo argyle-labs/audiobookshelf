@@ -87,6 +87,83 @@ impl ServiceBackend for AudiobookshelfBackend {
     }
 }
 
+// ── Media served_by facet ────────────────────────────────────────────────────
+//
+// Audiobookshelf is not only a deployable *service* — it *serves* audiobooks and
+// podcasts. It registers a `media` backend per served type so orca's generic
+// `media served-by` surface resolves the reachable URL (and, later, per-user
+// credentials) for device setup from ONE place. See orca#408 / #404.
+
+use plugin_toolkit::clap; // the endpoint_resource! tools emit unqualified `clap::` paths
+use plugin_toolkit::media::{Capability, MediaBackend, MediaError, MediaType, MediaUrl};
+
+/// Endpoint registry for the audiobookshelf server orca talks to: `(base_url,
+/// token)` keyed by `name`. `endpoint_resource!` emits the row struct, the
+/// `endpoint_db` accessors, schema fragment, and the
+/// `audiobookshelf.{list,detail,create,update,delete}` CRUD tools in one shot —
+/// the same pattern jellyfin/plex use. The media facet resolves its URL from an
+/// enabled row here at call time.
+#[plugin_toolkit::endpoint_resource(plugin = "audiobookshelf")]
+pub struct AudiobookshelfEndpoint {
+    pub name: String,
+    pub base_url: String,
+    #[secret]
+    pub token: String,
+    pub enabled: bool,
+}
+
+/// A media `served_by` backend for one media type Audiobookshelf serves. One is
+/// registered per served type (audiobooks, podcasts) — the builder gives each a
+/// type-qualified invoke prefix so they never collide.
+#[derive(Debug, Clone)]
+pub struct AbsMedia {
+    media_type: MediaType,
+}
+
+impl AbsMedia {
+    /// Register Audiobookshelf as the server (`served_by`) for `media_type`.
+    pub fn served(media_type: MediaType) -> Self {
+        Self { media_type }
+    }
+}
+
+#[plugin_toolkit::orca_async]
+impl MediaBackend for AbsMedia {
+    fn name(&self) -> &str {
+        "audiobookshelf"
+    }
+    fn media_type(&self) -> MediaType {
+        self.media_type
+    }
+    /// A server that hands out a reachable URL for device setup. `credentials`
+    /// (per-user, orca-managed) lands with the served_by credential brokerage
+    /// (orca#406); `units` with the library-view slice (orca#408 follow-up).
+    fn capabilities(&self) -> Vec<Capability> {
+        vec![Capability::ServedBy, Capability::Url]
+    }
+    /// Built at startup (outside the capability sink), so this must not touch the
+    /// db — the real reachable URL is resolved lazily in [`url`](Self::url).
+    fn endpoint(&self) -> String {
+        String::new()
+    }
+
+    /// Resolve the reachable base URL from the first enabled configured endpoint.
+    /// Runs inside an `Invoke` (cap sink active), so the `endpoint_db` read is
+    /// valid here. `media served-by --media-type audiobooks` returns this URL.
+    async fn url(&self) -> Result<MediaUrl, MediaError> {
+        let rows = endpoint_db::list()
+            .map_err(|e| MediaError::Transport(format!("read endpoints: {e}")))?;
+        let ep = rows
+            .into_iter()
+            .find(|r| r.enabled)
+            .ok_or_else(|| MediaError::NotFound("no enabled audiobookshelf endpoint".into()))?;
+        Ok(MediaUrl {
+            primary: ep.base_url,
+            alternates: Vec::new(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +172,14 @@ mod tests {
     fn declares_provider() {
         let b = AudiobookshelfBackend::new("audiobookshelf");
         assert_eq!(b.provider(), "audiobookshelf");
+    }
+
+    #[test]
+    fn media_facet_is_a_served_by_url_backend() {
+        let m = AbsMedia::served(MediaType::Audiobooks);
+        assert_eq!(m.name(), "audiobookshelf");
+        assert_eq!(m.media_type(), MediaType::Audiobooks);
+        assert!(m.capabilities().contains(&Capability::ServedBy));
+        assert!(m.capabilities().contains(&Capability::Url));
     }
 }
