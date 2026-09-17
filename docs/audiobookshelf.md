@@ -35,7 +35,7 @@ docker compose logs audiobookshelf
 
 ## Scan-on-import integration (orca)
 
-New audiobooks land on the willow share, so ABS's watcher does not fire — a push
+New audiobooks land on the `<nas-host>` share, so ABS's watcher does not fire — a push
 scan is required. ABS has no native *arr connector, so scans are triggered by the
 [download-client scan dispatcher](../../sabnzbd/docs/scan-dispatcher.md) on `books`/
 `audiobooks` category completions.
@@ -49,7 +49,7 @@ keys (`/api/api-keys`) — the dispatcher currently does login→scan for durabi
 against token expiry.
 
 **Creds:** 1Password `audiobookshelf (orca)` (orca vault). **Endpoint:**
-`http://10.10.10.6:13378` (baldur).
+`http://10.0.0.6:13378` (`<abs-host>`).
 
 **Follow-up:** Libation (Audible) writes audiobooks without going through the
 download clients — it needs its own post-download hook to trigger a scan here.
