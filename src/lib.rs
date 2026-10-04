@@ -7,12 +7,12 @@
 #![allow(clippy::disallowed_types)]
 
 use plugin_toolkit::service::{
-    BoxFuture, Endpoint, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
+    BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
     WorkloadSpec,
 };
 
-/// audiobookshelf backend. Holds only the provider name; per-instance endpoint/creds
-/// come from the `Endpoint` the generic `service.*` tools hand each op.
+/// audiobookshelf backend. Holds only the provider name; per-instance routes/creds
+/// come from the `Routes` the generic `service.*` tools hand each op.
 #[derive(Debug, Clone)]
 pub struct AudiobookshelfBackend {
     provider: &'static str,
@@ -61,7 +61,8 @@ impl ServiceBackend for AudiobookshelfBackend {
     fn workload_spec<'a>(
         &'a self,
         _runtime: Runtime,
-        _ep: &'a Endpoint,
+        _instance: &'a str,
+        _routes: &'a Routes,
     ) -> BoxFuture<'a, Result<WorkloadSpec, ServiceError>> {
         // TODO: describe the audiobookshelf workload (image/template, ports, mounts,
         // env) for the chosen runtime. The deploy target turns this into a
@@ -71,7 +72,8 @@ impl ServiceBackend for AudiobookshelfBackend {
 
     fn configure<'a>(
         &'a self,
-        _ep: &'a Endpoint,
+        _instance: &'a str,
+        _routes: &'a Routes,
         _config: &'a str,
     ) -> BoxFuture<'a, Result<(), ServiceError>> {
         // TODO: apply audiobookshelf-specific config idempotently.
@@ -80,7 +82,8 @@ impl ServiceBackend for AudiobookshelfBackend {
 
     fn status<'a>(
         &'a self,
-        _ep: &'a Endpoint,
+        _instance: &'a str,
+        _routes: &'a Routes,
     ) -> BoxFuture<'a, Result<ServiceStatus, ServiceError>> {
         // TODO: real health/diagnostics.
         Box::pin(async move { Err(ServiceError::unimplemented("audiobookshelf.status")) })
@@ -298,6 +301,8 @@ impl<'a> AbsClient<'a> {
                             item.id
                         )),
                     }],
+                    downloaded_by: Vec::new(),
+                    served_by: vec!["audiobookshelf".to_string()],
                 });
             }
         }
