@@ -1,12 +1,7 @@
-//! Dynamic (subprocess) entrypoint for the audiobookshelf plugin.
-//!
-//! Audiobookshelf is a **multi-facet** plugin: a deployable `service` AND a
-//! media `served_by` server for audiobooks + podcasts. The unified
-//! [`Plugin`](plugin_toolkit::plugin::Plugin) builder advertises all three
-//! facets from one binary (one merged `backends` array, one composed dispatch),
-//! plus the `audiobookshelf.*` endpoint-registry tools. Referencing the lib's
-//! types here force-links its `#[orca_tool]` inventory so it survives linking.
 plugin_toolkit::instrument::bootstrap!();
+
+#[allow(unused_imports)]
+use audiobookshelf::tools as _;
 
 fn main() -> plugin_toolkit::anyhow::Result<()> {
     use plugin_toolkit::media::MediaType;
