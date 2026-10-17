@@ -1,9 +1,3 @@
-//! audiobookshelf service backend — Audiobook + podcast server.
-//!
-//! Implements `ServiceBackend` so the generic `service.*` tools
-//! (deploy/backup/restore/configure/status/connect/sync) drive audiobookshelf. No
-//! `#[orca_tool]`s — the only orca dep is `plugin-toolkit`. Modeled on the
-//! nfs StorageBackend. See orca/docs/PLUGIN-PROGRAM.md.
 #![allow(clippy::disallowed_types)]
 
 use plugin_toolkit::service::{
@@ -11,8 +5,6 @@ use plugin_toolkit::service::{
     WorkloadSpec,
 };
 
-/// audiobookshelf backend. Holds only the provider name; per-instance routes/creds
-/// come from the `Routes` the generic `service.*` tools hand each op.
 #[derive(Debug, Clone)]
 pub struct AudiobookshelfBackend {
     provider: &'static str,
@@ -29,9 +21,6 @@ impl ServiceBackend for AudiobookshelfBackend {
         self.provider
     }
 
-    /// Runtimes audiobookshelf can be placed on. `service.deploy` hands the
-    /// `workload_spec` below to a matching deploy target — this backend never
-    /// drives pct/docker itself (that mechanic lives in the deploy-target domain).
     fn runtimes(&self) -> Vec<Runtime> {
         vec![Runtime::Docker, Runtime::Podman, Runtime::Lxc, Runtime::Vm]
     }
@@ -50,10 +39,6 @@ impl ServiceBackend for AudiobookshelfBackend {
         13378
     }
 
-    /// In-workload paths holding config/data. This is ALL audiobookshelf declares for
-    /// backup — the generic pluggable backup (tar for containers/LXC, PBS for
-    /// Proxmox guests when available) snapshots these. No backup/restore code
-    /// here; those are inherited from ServiceBackend's defaults.
     fn data_paths(&self) -> Vec<String> {
         vec!["/config".to_string()]
     }
@@ -64,9 +49,6 @@ impl ServiceBackend for AudiobookshelfBackend {
         _instance: &'a str,
         _routes: &'a Routes,
     ) -> BoxFuture<'a, Result<WorkloadSpec, ServiceError>> {
-        // TODO: describe the audiobookshelf workload (image/template, ports, mounts,
-        // env) for the chosen runtime. The deploy target turns this into a
-        // compose service / LXC config / VM. See deploy-target::WorkloadSpec.
         Box::pin(async move { Err(ServiceError::unimplemented("audiobookshelf.workload_spec")) })
     }
 
@@ -76,7 +58,6 @@ impl ServiceBackend for AudiobookshelfBackend {
         _routes: &'a Routes,
         _config: &'a str,
     ) -> BoxFuture<'a, Result<(), ServiceError>> {
-        // TODO: apply audiobookshelf-specific config idempotently.
         Box::pin(async move { Err(ServiceError::unimplemented("audiobookshelf.configure")) })
     }
 
@@ -85,7 +66,6 @@ impl ServiceBackend for AudiobookshelfBackend {
         _instance: &'a str,
         _routes: &'a Routes,
     ) -> BoxFuture<'a, Result<ServiceStatus, ServiceError>> {
-        // TODO: real health/diagnostics.
         Box::pin(async move { Err(ServiceError::unimplemented("audiobookshelf.status")) })
     }
 }
@@ -103,7 +83,6 @@ use plugin_toolkit::media::{
 #[plugin_toolkit::endpoint_resource(plugin = "audiobookshelf")]
 pub struct AudiobookshelfEndpoint {
     pub name: String,
-    pub base_url: String,
     #[secret]
     pub token: String,
     pub enabled: bool,
@@ -124,7 +103,8 @@ impl AbsMedia {
             .map_err(|e| MediaError::Transport(format!("read endpoints: {e}")))?;
         let ep = rows
             .into_iter()
-            .find(|r| r.enabled)
+            .filter(|r| r.enabled)
+            .min_by(|a, b| a.name.cmp(&b.name))
             .ok_or_else(|| MediaError::NotFound("no enabled audiobookshelf endpoint".into()))?;
         tools::connect(&ep.name)
             .await
@@ -252,7 +232,12 @@ mod tests {
         }
     }
 
-    fn serve<F>(routes: Vec<(&'static str, serde_json::Value)>, body: F) -> Vec<String>
+    type Call = (String, String, serde_json::Value);
+
+    fn serve_with<F>(
+        route: impl Fn(&str, &str) -> Option<(u16, String)> + 'static,
+        body: F,
+    ) -> Vec<Call>
     where
         F: FnOnce(),
     {
@@ -263,29 +248,47 @@ mod tests {
                 assert_eq!(cap, "http.request");
                 let req: serde_json::Value = serde_json::from_str(req).unwrap();
                 let url = req["url"].as_str().unwrap().to_string();
+                let method = req["method"].as_str().unwrap().to_string();
                 let auth = req["headers"].as_array().unwrap().iter().any(|h| {
                     h[0].as_str().unwrap().eq_ignore_ascii_case("authorization")
                         && h[1] == "Bearer tok"
                 });
                 assert!(auth, "missing bearer on {url}");
+                let raw: Vec<u8> = req["body"]
+                    .as_array()
+                    .map(|b| b.iter().map(|x| x.as_u64().unwrap() as u8).collect())
+                    .unwrap_or_default();
+                let sent = serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
+                let path = url.trim_start_matches("http://abs.test").to_string();
                 log.lock()
                     .unwrap()
-                    .push(format!("{} {url}", req["method"].as_str().unwrap()));
-                let path = url.trim_start_matches("http://abs.test");
-                let body = routes
-                    .iter()
-                    .find(|(p, _)| path == *p || path.starts_with(&format!("{p}?")))
-                    .map(|(_, b)| b.to_string());
-                let (status, body) = match body {
-                    Some(b) => (200, b),
-                    None => (404, "Not Found".to_string()),
-                };
+                    .push((method.clone(), path.clone(), sent));
+                let (status, body) =
+                    route(&method, &path).unwrap_or((404, "Not Found".to_string()));
                 Ok(json!({"status": status, "headers": [], "body": body.into_bytes()}).to_string())
             }),
             body,
         );
         let out = seen.lock().unwrap().clone();
         out
+    }
+
+    fn serve<F>(routes: Vec<(&'static str, serde_json::Value)>, body: F) -> Vec<String>
+    where
+        F: FnOnce(),
+    {
+        serve_with(
+            move |_, path| {
+                routes
+                    .iter()
+                    .find(|(p, _)| path == *p || path.starts_with(&format!("{p}?")))
+                    .map(|(_, b)| (200, b.to_string()))
+            },
+            body,
+        )
+        .into_iter()
+        .map(|(m, p, _)| format!("{m} http://abs.test{p}"))
+        .collect()
     }
 
     fn block<T>(f: impl std::future::Future<Output = T>) -> T {
@@ -296,7 +299,7 @@ mod tests {
     }
 
     fn abs() -> api::Abs {
-        api::Abs::new("http://abs.test/", "tok", false).unwrap()
+        api::Abs::new("http://abs.test/", "tok").unwrap()
     }
 
     #[test]
@@ -398,5 +401,177 @@ mod tests {
             },
         );
         assert_eq!(calls, vec!["PATCH http://abs.test/api/items/li_1/media"]);
+    }
+
+    #[test]
+    fn items_page_until_total_with_minified() {
+        let page = |n: usize, start: usize| {
+            let results: Vec<_> = (start..start + n)
+                .map(|i| json!({"id": format!("li_{i}"), "media": {"metadata": {"title": "t"}}}))
+                .collect();
+            json!({"total": 600, "results": results}).to_string()
+        };
+        let mut got = Vec::new();
+        let calls = serve_with(
+            move |_, path| {
+                if path.contains("page=0") {
+                    Some((200, page(500, 0)))
+                } else if path.contains("page=1") {
+                    Some((200, page(100, 500)))
+                } else {
+                    None
+                }
+            },
+            || got = block(abs().items("lib")).unwrap(),
+        );
+        assert_eq!(got.len(), 600);
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls.iter().all(|c| c.1.contains("minified=1")),
+            "{calls:?}"
+        );
+    }
+
+    fn update_routes() -> impl Fn(&str, &str) -> Option<(u16, String)> {
+        |method, path| match (method, path) {
+            ("GET", p) if p.starts_with("/api/items/li_1?") => Some((
+                200,
+                json!({"id": "li_1", "libraryId": "lib", "media": {"metadata": {
+                    "title": "Dune", "authors": [{"name": "Frank Herbert"}],
+                    "series": [{"name": "Dune", "sequence": "1"}]
+                }}})
+                .to_string(),
+            )),
+            ("PATCH", "/api/items/li_1/media") => Some((200, json!({"updated": true}).to_string())),
+            _ => None,
+        }
+    }
+
+    fn update_args() -> tools::UpdateArgs {
+        tools::UpdateArgs {
+            name: "abs".into(),
+            item_id: "li_1".into(),
+            title: None,
+            authors: Some(vec![" Frank Herbert ".into(), "Kevin J. Anderson".into()]),
+            series: Some("Dune".into()),
+            sequence: Some("2".into()),
+            clear_series: false,
+        }
+    }
+
+    #[test]
+    fn update_sends_the_patch_body_over_the_wire() {
+        let calls = serve_with(update_routes(), || {
+            let r = block(tools::update_item(&abs(), update_args(), false)).unwrap();
+            assert!(r.updated);
+        });
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].0, "PATCH");
+        assert_eq!(
+            calls[1].2,
+            json!({"metadata": {
+                "authors": [{"name": "Frank Herbert"}, {"name": "Kevin J. Anderson"}],
+                "series": [{"name": "Dune", "sequence": "2"}]
+            }})
+        );
+    }
+
+    #[test]
+    fn dry_run_update_sends_no_patch() {
+        let calls = serve_with(update_routes(), || {
+            let r = block(tools::update_item(&abs(), update_args(), true)).unwrap();
+            assert!(r.dry_run && !r.updated);
+            assert!(r.series.is_some());
+        });
+        assert!(calls.iter().all(|c| c.0 == "GET"), "{calls:?}");
+    }
+
+    #[test]
+    fn match_sends_override_flags_and_ids() {
+        let calls = serve_with(
+            |m, p| {
+                (m == "POST" && p == "/api/items/li_1/match")
+                    .then(|| (200, json!({"updated": true}).to_string()))
+            },
+            || {
+                let mut it = api::parse_item(
+                    &json!({"id": "li_1", "media": {"metadata": {"title": "Dune", "asin": "B002V1OF70", "authorName": "Frank Herbert"}}}),
+                    "lib",
+                );
+                it.isbn = None;
+                assert!(block(abs().match_item(&it, "audible", true)).unwrap());
+            },
+        );
+        assert_eq!(
+            calls[0].2,
+            json!({
+                "provider": "audible", "overrideDetails": true, "overrideCover": false,
+                "title": "Dune", "author": "Frank Herbert", "asin": "B002V1OF70"
+            })
+        );
+    }
+
+    #[test]
+    fn matchall_starts_a_library_match() {
+        let calls = serve(vec![("/api/libraries/lib/matchall", json!("OK"))], || {
+            block(abs().match_library("lib")).unwrap()
+        });
+        assert_eq!(
+            calls,
+            vec!["GET http://abs.test/api/libraries/lib/matchall"]
+        );
+    }
+
+    #[test]
+    fn non_json_success_fails_a_write() {
+        serve_with(
+            |_, _| Some((200, "OK".to_string())),
+            || {
+                let patch = api::MetadataPatch {
+                    title: Some("X".into()),
+                    ..Default::default()
+                };
+                let e = block(abs().update_metadata("li_1", &patch)).unwrap_err();
+                assert!(e.to_string().contains("expected JSON"), "{e}");
+            },
+        );
+    }
+
+    #[test]
+    fn error_bodies_are_truncated_and_scrubbed() {
+        serve_with(
+            |_, _| {
+                Some((
+                    500,
+                    format!(
+                        r#"{{"apiToken":"supersecretvalue123","pad":"{}"}}"#,
+                        "x".repeat(2000)
+                    ),
+                ))
+            },
+            || {
+                let e = block(abs().libraries()).unwrap_err().to_string();
+                assert!(e.len() < 400, "{}", e.len());
+                assert!(!e.contains("supersecretvalue123"), "{e}");
+            },
+        );
+    }
+
+    #[test]
+    fn connect_fails_when_the_token_secret_is_missing() {
+        let caps = Arc::new(Mutex::new(Vec::new()));
+        let log = caps.clone();
+        let e = plugin_toolkit::capsink::with_cap_sink(
+            Box::new(move |cap: &str, _: &str| {
+                log.lock().unwrap().push(cap.to_string());
+                match cap {
+                    "secret.op" => Ok(json!({"value": null}).to_string()),
+                    _ => Err(format!("unexpected {cap}")),
+                }
+            }),
+            || block(tools::connect("abs")).err().unwrap(),
+        );
+        assert!(format!("{e:#}").contains("audiobookshelf"), "{e:#}");
+        assert_eq!(*caps.lock().unwrap(), vec!["secret.op"]);
     }
 }

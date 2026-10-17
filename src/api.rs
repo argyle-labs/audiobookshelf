@@ -20,7 +20,6 @@ pub struct Library {
     pub name: String,
     pub media_type: String,
     pub provider: String,
-    pub folders: Vec<String>,
 }
 
 #[orca_struct]
@@ -44,7 +43,6 @@ pub struct Item {
     pub asin: Option<String>,
     pub isbn: Option<String>,
     pub published_year: Option<String>,
-    pub path: Option<String>,
 }
 
 #[orca_struct]
@@ -84,11 +82,8 @@ pub struct NameOnly {
 }
 
 impl Abs {
-    pub fn new(base_url: &str, token: &str, insecure: bool) -> Result<Self> {
-        let http = ApiClientBuilder::new()
-            .bearer(token)?
-            .insecure(insecure)
-            .build()?;
+    pub fn new(base_url: &str, token: &str) -> Result<Self> {
+        let http = ApiClientBuilder::new().bearer(token)?.build()?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
@@ -103,17 +98,19 @@ impl Abs {
         format!("{}{}", self.base_url, path)
     }
 
-    async fn send(&self, label: String, req: RequestBuilder) -> Result<Value> {
+    async fn send(&self, label: String, req: RequestBuilder, write: bool) -> Result<Value> {
         let resp = req.send().await.map_err(|e| anyhow!("{label}: {e}"))?;
         let status = resp.status();
         let body = resp.text().await.map_err(|e| anyhow!("{label}: {e}"))?;
         if !status.is_success() {
-            bail!("{label}: HTTP {} {}", status.as_u16(), body.trim());
+            bail!("{label}: HTTP {} {}", status.as_u16(), error_excerpt(&body));
         }
-        if body.trim().is_empty() {
-            return Ok(Value::Null);
+        match serde_json::from_str(&body) {
+            Ok(v) => Ok(v),
+            Err(_) if !write && body.trim().is_empty() => Ok(Value::Null),
+            Err(_) if !write => Ok(Value::String(body)),
+            Err(_) => bail!("{label}: expected JSON, got {}", error_excerpt(&body)),
         }
-        Ok(serde_json::from_str(&body).unwrap_or(Value::String(body)))
     }
 
     async fn get_json(&self, path: &str, query: &[(&str, String)]) -> Result<Value> {
@@ -122,7 +119,7 @@ impl Abs {
             .fold(self.http.get(self.url(path)), |r, (k, v)| {
                 r.query(&QueryParam::new(k, v))
             });
-        self.send(format!("GET {path}"), req).await
+        self.send(format!("GET {path}"), req, false).await
     }
 
     async fn send_json(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
@@ -135,7 +132,7 @@ impl Abs {
             Some(b) => req.json(&b),
             None => req,
         };
-        self.send(format!("{method} {path}"), req).await
+        self.send(format!("{method} {path}"), req, true).await
     }
 
     pub async fn libraries(&self) -> Result<Vec<Library>> {
@@ -156,7 +153,10 @@ impl Abs {
         } else {
             format!("/api/libraries/{library_id}/scan")
         };
-        self.send_json("POST", &path, None).await.map(|_| ())
+        let req = self.http.post(self.url(&path));
+        self.send(format!("POST {path}"), req, false)
+            .await
+            .map(|_| ())
     }
 
     pub async fn match_library(&self, library_id: &str) -> Result<()> {
@@ -174,7 +174,11 @@ impl Abs {
             let v = self
                 .get_json(
                     &path,
-                    &[("limit", PAGE.to_string()), ("page", page.to_string())],
+                    &[
+                        ("limit", PAGE.to_string()),
+                        ("page", page.to_string()),
+                        ("minified", "1".into()),
+                    ],
                 )
                 .await?;
             let results = arr(&v["results"]);
@@ -234,10 +238,17 @@ impl Abs {
         Ok(v["updated"].as_bool().unwrap_or(false))
     }
 
-    pub async fn match_item(&self, item: &Item, provider: &str) -> Result<bool> {
+    pub async fn match_item(
+        &self,
+        item: &Item,
+        provider: &str,
+        override_details: bool,
+    ) -> Result<bool> {
         check_id(&item.id)?;
         let mut body = json!({
             "provider": provider,
+            "overrideDetails": override_details,
+            "overrideCover": false,
             "title": item.title,
             "author": item.authors.first().cloned().unwrap_or_default(),
         });
@@ -268,6 +279,17 @@ impl Abs {
             .await?;
         Ok(arr(&v).iter().map(parse_provider_book).collect())
     }
+}
+
+const ERROR_EXCERPT: usize = 256;
+
+fn error_excerpt(body: &str) -> String {
+    let body = body.trim();
+    let cut = body
+        .char_indices()
+        .nth(ERROR_EXCERPT)
+        .map_or(body, |(i, _)| &body[..i]);
+    plugin_toolkit::logging::scrub(cut).into_owned()
 }
 
 pub fn check_id(id: &str) -> Result<()> {
@@ -364,10 +386,6 @@ fn parse_library(l: &Value) -> Library {
         name: str_of(&l["name"]),
         media_type: str_of(&l["mediaType"]),
         provider: str_of(&l["provider"]),
-        folders: arr(&l["folders"])
-            .iter()
-            .filter_map(|f| opt_str(&f["fullPath"]))
-            .collect(),
     }
 }
 
@@ -389,7 +407,6 @@ pub fn parse_item(i: &Value, library_id: &str) -> Item {
         asin: opt_str(&md["asin"]),
         isbn: opt_str(&md["isbn"]),
         published_year: opt_str(&md["publishedYear"]),
-        path: opt_str(&i["path"]),
     }
 }
 

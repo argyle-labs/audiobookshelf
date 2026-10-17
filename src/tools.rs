@@ -5,19 +5,10 @@ use crate::audit::{self, SeriesFinding};
 use crate::endpoint_db;
 
 pub async fn connect(name: &str) -> Result<Abs> {
+    let token = plugin_toolkit::secrets::resolve_scoped("audiobookshelf", name, "token")?;
     let row = endpoint_db::require(name)?;
-    let token = plugin_toolkit::secrets::resolve_scoped(
-        "audiobookshelf",
-        name,
-        "token",
-        (!row.token.is_empty()).then_some(row.token.as_str()),
-    )?;
-    let base_url = if row.routes.is_empty() {
-        row.base_url.clone()
-    } else {
-        route::resolve_reachable(name, &row.routes, false).await?
-    };
-    Abs::new(&base_url, &token, false)
+    let base_url = route::resolve_reachable(name, &row.routes, false).await?;
+    Abs::new(&base_url, token.expose_secret())
 }
 
 async fn book_libraries(abs: &Abs, library_id: Option<&str>) -> Result<Vec<Library>> {
@@ -46,7 +37,7 @@ pub struct EndpointArgs {
     pub name: String,
 }
 
-/// List libraries with media type, metadata provider, and folders.
+/// List libraries with media type and metadata provider.
 #[orca_tool(domain = "audiobookshelf", verb = "libraries.list", role = "read")]
 async fn audiobookshelf_libraries_list(args: EndpointArgs, _ctx: &ToolCtx) -> Result<Vec<Library>> {
     connect(&args.name).await?.libraries().await
@@ -166,7 +157,14 @@ pub struct UpdateReport {
     pub updated: bool,
 }
 
-pub fn build_patch(args: &UpdateArgs, before: &Item) -> MetadataPatch {
+pub fn build_patch(args: &UpdateArgs, before: &Item) -> Result<MetadataPatch> {
+    if args
+        .authors
+        .as_ref()
+        .is_some_and(|a| a.iter().any(|n| n.trim().is_empty()))
+    {
+        bail!("author names must not be empty");
+    }
     let series = if args.clear_series {
         Some(Vec::new())
     } else {
@@ -177,15 +175,16 @@ pub fn build_patch(args: &UpdateArgs, before: &Item) -> MetadataPatch {
             }]
         })
     };
-    MetadataPatch {
+    Ok(MetadataPatch {
         title: args.title.clone().filter(|t| *t != before.title),
         authors: args
             .authors
             .as_ref()
-            .filter(|a| **a != before.authors)
-            .map(|a| a.iter().map(|n| NameOnly { name: n.clone() }).collect()),
+            .map(|a| a.iter().map(|n| n.trim().to_string()).collect::<Vec<_>>())
+            .filter(|a| *a != before.authors)
+            .map(|a| a.into_iter().map(|name| NameOnly { name }).collect()),
         series: series.filter(|s| *s != before.series),
-    }
+    })
 }
 
 /// Update an item's title, authors, and series + sequence
@@ -200,17 +199,21 @@ pub fn build_patch(args: &UpdateArgs, before: &Item) -> MetadataPatch {
 )]
 async fn audiobookshelf_item_update(args: UpdateArgs, ctx: &ToolCtx) -> Result<UpdateReport> {
     let abs = connect(&args.name).await?;
+    update_item(&abs, args, ctx.dry_run()).await
+}
+
+pub async fn update_item(abs: &Abs, args: UpdateArgs, dry_run: bool) -> Result<UpdateReport> {
     let before = abs.item(&args.item_id).await?;
-    let patch = build_patch(&args, &before);
+    let patch = build_patch(&args, &before)?;
     let empty = patch == MetadataPatch::default();
-    let updated = if ctx.dry_run() || empty {
+    let updated = if dry_run || empty {
         false
     } else {
         abs.update_metadata(&args.item_id, &patch).await?
     };
     Ok(UpdateReport {
         item_id: args.item_id,
-        dry_run: ctx.dry_run(),
+        dry_run,
         before,
         title: patch.title,
         authors: patch
@@ -235,6 +238,14 @@ pub struct MatchArgs {
     /// Metadata provider. Omitted, the library's configured provider.
     #[arg(long)]
     pub provider: Option<String>,
+    /// Overwrite existing details with the provider's (single item only).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    #[serde(default = "yes")]
+    pub override_details: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[orca_struct]
@@ -244,6 +255,7 @@ pub struct MatchReport {
     pub library_id: String,
     pub provider: String,
     pub updated: bool,
+    pub started: bool,
 }
 
 /// Match metadata against the provider (Audible by default) and apply it:
@@ -265,12 +277,15 @@ async fn audiobookshelf_item_match(args: MatchArgs, _ctx: &ToolCtx) -> Result<Ma
                 Some(p) => p,
                 None => abs.library(&item.library_id).await?.provider,
             };
-            let updated = abs.match_item(&item, &provider).await?;
+            let updated = abs
+                .match_item(&item, &provider, args.override_details)
+                .await?;
             Ok(MatchReport {
                 item_id: Some(item_id),
                 library_id: item.library_id,
                 provider,
                 updated,
+                started: false,
             })
         }
         (None, Some(library_id)) => {
@@ -283,7 +298,8 @@ async fn audiobookshelf_item_match(args: MatchArgs, _ctx: &ToolCtx) -> Result<Ma
                 item_id: None,
                 library_id,
                 provider: lib.provider,
-                updated: true,
+                updated: false,
+                started: true,
             })
         }
         _ => bail!("pass exactly one of item_id or library_id"),
@@ -302,13 +318,23 @@ pub struct AuditArgs {
     #[arg(long, value_delimiter = ',')]
     #[serde(default)]
     pub item_ids: Vec<String>,
-    /// Stop after this many items (one provider lookup each).
+    /// Stop after this many items (one provider lookup each). Default 50, max 500.
     #[arg(long)]
     pub limit: Option<usize>,
     /// Include items the provider returned nothing for.
     #[arg(long)]
     #[serde(default)]
     pub include_unmatched: bool,
+}
+
+const AUDIT_DEFAULT: usize = 50;
+const AUDIT_MAX: usize = 500;
+
+pub fn audit_limit(limit: Option<usize>) -> Result<usize> {
+    match limit.unwrap_or(AUDIT_DEFAULT) {
+        n if n > AUDIT_MAX => bail!("limit {n} exceeds the maximum of {AUDIT_MAX}"),
+        n => Ok(n),
+    }
 }
 
 #[orca_struct]
@@ -330,7 +356,7 @@ async fn audiobookshelf_series_audit(args: AuditArgs, _ctx: &ToolCtx) -> Result<
         findings: Vec::new(),
         failed: Vec::new(),
     };
-    let limit = args.limit.unwrap_or(usize::MAX);
+    let limit = audit_limit(args.limit)?;
     'libs: for lib in book_libraries(&abs, args.library_id.as_deref()).await? {
         for item in abs.items(&lib.id).await? {
             if report.checked >= limit {
@@ -379,7 +405,6 @@ mod tests {
             asin: None,
             isbn: None,
             published_year: None,
-            path: None,
         }
     }
 
@@ -402,18 +427,32 @@ mod tests {
         a.authors = Some(vec!["Frank Herbert".into()]);
         a.series = Some("Dune".into());
         a.sequence = Some("1".into());
-        assert_eq!(build_patch(&a, &item()), MetadataPatch::default());
+        assert_eq!(build_patch(&a, &item()).unwrap(), MetadataPatch::default());
         a.sequence = Some("2".into());
-        let p = build_patch(&a, &item());
+        let p = build_patch(&a, &item()).unwrap();
         assert_eq!(p.series.unwrap()[0].sequence.as_deref(), Some("2"));
         assert_eq!(p.title, None);
+    }
+
+    #[test]
+    fn rejects_empty_author_names() {
+        let mut a = args();
+        a.authors = Some(vec!["A".into(), " ".into()]);
+        assert!(build_patch(&a, &item()).is_err());
+    }
+
+    #[test]
+    fn audit_limit_defaults_and_caps() {
+        assert_eq!(audit_limit(None).unwrap(), 50);
+        assert_eq!(audit_limit(Some(500)).unwrap(), 500);
+        assert!(audit_limit(Some(501)).is_err());
     }
 
     #[test]
     fn clear_series_sends_an_empty_list() {
         let mut a = args();
         a.clear_series = true;
-        assert_eq!(build_patch(&a, &item()).series, Some(Vec::new()));
+        assert_eq!(build_patch(&a, &item()).unwrap().series, Some(Vec::new()));
     }
 
     #[test]
@@ -421,7 +460,7 @@ mod tests {
         let mut a = args();
         a.authors = Some(vec!["A".into(), "B".into()]);
         a.series = Some("S".into());
-        let v = plugin_toolkit::serde_json::to_value(build_patch(&a, &item())).unwrap();
+        let v = plugin_toolkit::serde_json::to_value(build_patch(&a, &item()).unwrap()).unwrap();
         assert_eq!(
             v,
             json!({"authors": [{"name": "A"}, {"name": "B"}], "series": [{"name": "S", "sequence": null}]})

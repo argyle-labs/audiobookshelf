@@ -118,7 +118,6 @@ mod tests {
             asin: asin.map(String::from),
             isbn: None,
             published_year: None,
-            path: None,
         }
     }
 
