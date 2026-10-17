@@ -90,27 +90,16 @@ impl ServiceBackend for AudiobookshelfBackend {
     }
 }
 
-// ── Media served_by facet ────────────────────────────────────────────────────
-//
-// Audiobookshelf is not only a deployable *service* — it *serves* audiobooks and
-// podcasts. It registers a `media` backend per served type so orca's generic
-// `media served-by` surface resolves the reachable URL (and, later, per-user
-// credentials) for device setup from ONE place. See orca#408 / #404.
+pub mod api;
+pub mod audit;
+pub mod tools;
 
-use plugin_toolkit::clap; // the endpoint_resource! tools emit unqualified `clap::` paths
-use plugin_toolkit::http::{Client as HttpClient, Response};
+use plugin_toolkit::clap;
 use plugin_toolkit::media::{
     Capability, MediaBackend, MediaError, MediaIdentity, MediaType, MediaUnit, MediaUrl, SeriesRef,
     Source, SourceKind,
 };
-use plugin_toolkit::serde;
 
-/// Endpoint registry for the audiobookshelf server orca talks to: `(base_url,
-/// token)` keyed by `name`. `endpoint_resource!` emits the row struct, the
-/// `endpoint_db` accessors, schema fragment, and the
-/// `audiobookshelf.{list,detail,create,update,delete}` CRUD tools in one shot —
-/// the same pattern jellyfin/plex use. The media facet resolves its URL from an
-/// enabled row here at call time.
 #[plugin_toolkit::endpoint_resource(plugin = "audiobookshelf")]
 pub struct AudiobookshelfEndpoint {
     pub name: String,
@@ -120,18 +109,26 @@ pub struct AudiobookshelfEndpoint {
     pub enabled: bool,
 }
 
-/// A media `served_by` backend for one media type Audiobookshelf serves. One is
-/// registered per served type (audiobooks, podcasts) — the builder gives each a
-/// type-qualified invoke prefix so they never collide.
 #[derive(Debug, Clone)]
 pub struct AbsMedia {
     media_type: MediaType,
 }
 
 impl AbsMedia {
-    /// Register Audiobookshelf as the server (`served_by`) for `media_type`.
     pub fn served(media_type: MediaType) -> Self {
         Self { media_type }
+    }
+
+    async fn connect(&self) -> Result<api::Abs, MediaError> {
+        let rows = endpoint_db::list()
+            .map_err(|e| MediaError::Transport(format!("read endpoints: {e}")))?;
+        let ep = rows
+            .into_iter()
+            .find(|r| r.enabled)
+            .ok_or_else(|| MediaError::NotFound("no enabled audiobookshelf endpoint".into()))?;
+        tools::connect(&ep.name)
+            .await
+            .map_err(|e| MediaError::Transport(format!("{e:#}")))
     }
 }
 
@@ -143,228 +140,101 @@ impl MediaBackend for AbsMedia {
     fn media_type(&self) -> MediaType {
         self.media_type
     }
-    /// A server that hands out a reachable URL + a converged library view.
-    /// `credentials` (per-user, orca-managed) lands with the served_by credential
-    /// brokerage (orca#406).
     fn capabilities(&self) -> Vec<Capability> {
         vec![Capability::ServedBy, Capability::Url, Capability::Units]
     }
-    /// Built at startup (outside the capability sink), so this must not touch the
-    /// db — the real reachable URL is resolved lazily in [`url`](Self::url).
     fn endpoint(&self) -> String {
         String::new()
     }
 
-    /// Resolve the reachable base URL from the first enabled configured endpoint.
-    /// Runs inside an `Invoke` (cap sink active), so the `endpoint_db` read is
-    /// valid here. `media served-by --media-type audiobooks` returns this URL.
     async fn url(&self) -> Result<MediaUrl, MediaError> {
-        let cfg = self.resolve_config()?;
         Ok(MediaUrl {
-            primary: cfg.base_url,
+            primary: self.connect().await?.base_url().to_string(),
             alternates: Vec::new(),
         })
     }
 
-    /// This backend's partial convergence view: every library item Audiobookshelf
-    /// serves for this media type, as a [`MediaUnit`] carrying its identity
-    /// (title + series + ASIN/ISBN external ids, normalized via the media
-    /// identity helpers) and an `AppStream` source pointing at the item. Core
-    /// merges these with other backends' views (see `media.unit-list`).
     async fn units(&self) -> Result<Vec<MediaUnit>, MediaError> {
-        let cfg = self.resolve_config()?;
-        AbsClient::new(&cfg).units(self.media_type).await
-    }
-}
-
-impl AbsMedia {
-    /// Load the first enabled configured endpoint as an [`AbsConfig`]. The
-    /// `endpoint_db` read is only valid inside an `Invoke` (cap sink active), so
-    /// this is called from the async verbs, never from `endpoint()`.
-    fn resolve_config(&self) -> Result<AbsConfig, MediaError> {
-        let rows = endpoint_db::list()
-            .map_err(|e| MediaError::Transport(format!("read endpoints: {e}")))?;
-        let ep = rows
-            .into_iter()
-            .find(|r| r.enabled)
-            .ok_or_else(|| MediaError::NotFound("no enabled audiobookshelf endpoint".into()))?;
-        Ok(AbsConfig {
-            base_url: ep.base_url,
-            token: ep.token,
-        })
-    }
-}
-
-// ── Audiobookshelf HTTP client (library view) ────────────────────────────────
-
-/// Resolved connection to one Audiobookshelf server.
-struct AbsConfig {
-    base_url: String,
-    token: String,
-}
-
-/// Minimal Audiobookshelf API client: Bearer-token GET + JSON decode, enough for
-/// the `units()` library view. Grows request-by-request as more verbs land.
-struct AbsClient<'a> {
-    cfg: &'a AbsConfig,
-    http: HttpClient,
-}
-
-impl<'a> AbsClient<'a> {
-    fn new(cfg: &'a AbsConfig) -> Self {
-        Self {
-            cfg,
-            http: HttpClient::new(),
-        }
-    }
-
-    async fn get(&self, path: &str) -> Result<Response, MediaError> {
-        self.http
-            .get(format!(
-                "{}{}",
-                self.cfg.base_url.trim_end_matches('/'),
-                path
-            ))
-            .header("authorization", format!("Bearer {}", self.cfg.token))
-            .header("accept", "application/json")
-            .send()
+        let abs = self.connect().await?;
+        units(&abs, self.media_type)
             .await
-            .map_err(|e| MediaError::Transport(format!("GET {path}: {e}")))
+            .map_err(|e| MediaError::Transport(format!("{e:#}")))
     }
+}
 
-    async fn libraries(&self) -> Result<Vec<AbsLibrary>, MediaError> {
-        let resp = self.get("/api/libraries").await?;
-        Ok(resp
-            .json::<LibrariesResp>()
-            .map_err(|e| MediaError::Transport(format!("decode libraries: {e}")))?
-            .libraries)
+pub fn abs_media_type(media_type: MediaType) -> Option<&'static str> {
+    match media_type {
+        MediaType::Audiobooks => Some("book"),
+        MediaType::Podcasts => Some("podcast"),
+        _ => None,
     }
+}
 
-    async fn library_items(&self, library_id: &str) -> Result<Vec<AbsItem>, MediaError> {
-        let resp = self
-            .get(&format!("/api/libraries/{library_id}/items"))
-            .await?;
-        Ok(resp
-            .json::<ItemsResp>()
-            .map_err(|e| MediaError::Transport(format!("decode items: {e}")))?
-            .results)
-    }
-
-    /// The convergence view for `media_type`: every item in the matching-kind
-    /// libraries (ABS `mediaType` book/podcast), mapped to a [`MediaUnit`] with
-    /// title + series + ASIN/ISBN identity and an `AppStream` source. The
-    /// `MediaBackend::units` verb delegates here so the whole libraries→items→
-    /// map path is exercised against a mock server without the endpoint db.
-    async fn units(&self, media_type: MediaType) -> Result<Vec<MediaUnit>, MediaError> {
-        let want = match media_type {
-            MediaType::Audiobooks => "book",
-            MediaType::Podcasts => "podcast",
-            _ => return Ok(Vec::new()),
-        };
-        let mut units = Vec::new();
-        for lib in self
-            .libraries()
-            .await?
-            .into_iter()
-            .filter(|l| l.media_type == want)
-        {
-            for item in self.library_items(&lib.id).await? {
-                let md = item.media.metadata;
-                let Some(title) = md.title.filter(|t| !t.is_empty()) else {
-                    continue;
-                };
-                let mut identity = MediaIdentity {
-                    title,
-                    year: None,
-                    external_ids: Vec::new(),
-                    series: md.series_name.map(|name| SeriesRef {
-                        name,
-                        sequence: None,
-                    }),
-                };
-                if let Some(asin) = md.asin.filter(|s| !s.is_empty()) {
-                    identity = identity.with_external_id("asin", &asin, media_type);
-                }
-                if let Some(isbn) = md.isbn.filter(|s| !s.is_empty()) {
-                    identity = identity.with_external_id("isbn", &isbn, media_type);
-                }
-                units.push(MediaUnit {
-                    media_type,
-                    identity,
-                    variants: Vec::new(),
-                    sources: vec![Source {
-                        method: SourceKind::AppStream,
-                        by: "audiobookshelf".to_string(),
-                        url: Some(format!(
-                            "{}/item/{}",
-                            self.cfg.base_url.trim_end_matches('/'),
-                            item.id
-                        )),
-                    }],
-                    downloaded_by: Vec::new(),
-                    served_by: vec!["audiobookshelf".to_string()],
-                });
+pub async fn units(
+    abs: &api::Abs,
+    media_type: MediaType,
+) -> plugin_toolkit::anyhow::Result<Vec<MediaUnit>> {
+    let Some(want) = abs_media_type(media_type) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for lib in abs
+        .libraries()
+        .await?
+        .into_iter()
+        .filter(|l| l.media_type == want)
+    {
+        for item in abs.items(&lib.id).await? {
+            if let Some(u) = to_unit(abs.base_url(), &item, media_type) {
+                out.push(u);
             }
         }
-        Ok(units)
     }
+    Ok(out)
 }
 
-#[derive(serde::Deserialize)]
-#[serde(crate = "plugin_toolkit::serde")]
-struct LibrariesResp {
-    #[serde(default)]
-    libraries: Vec<AbsLibrary>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(crate = "plugin_toolkit::serde")]
-struct AbsLibrary {
-    #[serde(default)]
-    id: String,
-    #[serde(default, rename = "mediaType")]
-    media_type: String,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(crate = "plugin_toolkit::serde")]
-struct ItemsResp {
-    #[serde(default)]
-    results: Vec<AbsItem>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(crate = "plugin_toolkit::serde")]
-struct AbsItem {
-    #[serde(default)]
-    id: String,
-    #[serde(default)]
-    media: AbsItemMedia,
-}
-
-#[derive(serde::Deserialize, Default)]
-#[serde(crate = "plugin_toolkit::serde")]
-struct AbsItemMedia {
-    #[serde(default)]
-    metadata: AbsMetadata,
-}
-
-#[derive(serde::Deserialize, Default)]
-#[serde(crate = "plugin_toolkit::serde")]
-struct AbsMetadata {
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default)]
-    asin: Option<String>,
-    #[serde(default)]
-    isbn: Option<String>,
-    #[serde(default, rename = "seriesName")]
-    series_name: Option<String>,
+pub fn to_unit(base_url: &str, item: &api::Item, media_type: MediaType) -> Option<MediaUnit> {
+    if item.title.is_empty() {
+        return None;
+    }
+    let mut identity = MediaIdentity {
+        title: item.title.clone(),
+        year: item.published_year.as_deref().and_then(|y| y.parse().ok()),
+        external_ids: Vec::new(),
+        series: item.series.first().map(|s| SeriesRef {
+            name: s.name.clone(),
+            sequence: s.sequence.clone(),
+        }),
+    };
+    if let Some(asin) = &item.asin {
+        identity = identity.with_external_id("asin", asin, media_type);
+    }
+    if let Some(isbn) = &item.isbn {
+        identity = identity.with_external_id("isbn", isbn, media_type);
+    }
+    Some(MediaUnit {
+        media_type,
+        identity,
+        variants: Vec::new(),
+        sources: vec![Source {
+            method: SourceKind::AppStream,
+            by: "audiobookshelf".to_string(),
+            url: Some(format!(
+                "{}/item/{}",
+                base_url.trim_end_matches('/'),
+                item.id
+            )),
+        }],
+        downloaded_by: Vec::new(),
+        served_by: vec!["audiobookshelf".to_string()],
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plugin_toolkit::serde_json::{self, json};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn declares_provider() {
@@ -382,114 +252,151 @@ mod tests {
         }
     }
 
-    // Pins the ABS `/api/libraries/{id}/items` JSON shape this backend maps from —
-    // a rename (`mediaType`, `seriesName`) or nesting change breaks the units view.
-    #[test]
-    fn abs_item_json_decodes_the_metadata_fields() {
-        let raw = plugin_toolkit::serde_json::json!({
-            "results": [{
-                "id": "li_abc",
-                "media": { "metadata": {
-                    "title": "The Way of Kings",
-                    "asin": "B0041JKFJW",
-                    "isbn": null,
-                    "seriesName": "The Stormlight Archive"
-                }}
-            }]
-        });
-        let parsed: ItemsResp = plugin_toolkit::serde_json::from_value(raw).unwrap();
-        assert_eq!(parsed.results.len(), 1);
-        let md = &parsed.results[0].media.metadata;
-        assert_eq!(md.title.as_deref(), Some("The Way of Kings"));
-        assert_eq!(md.asin.as_deref(), Some("B0041JKFJW"));
-        assert_eq!(md.isbn, None);
-        assert_eq!(md.series_name.as_deref(), Some("The Stormlight Archive"));
-        assert_eq!(parsed.results[0].id, "li_abc");
+    fn serve<F>(routes: Vec<(&'static str, serde_json::Value)>, body: F) -> Vec<String>
+    where
+        F: FnOnce(),
+    {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        plugin_toolkit::capsink::with_cap_sink(
+            Box::new(move |cap: &str, req: &str| {
+                assert_eq!(cap, "http.request");
+                let req: serde_json::Value = serde_json::from_str(req).unwrap();
+                let url = req["url"].as_str().unwrap().to_string();
+                let auth = req["headers"].as_array().unwrap().iter().any(|h| {
+                    h[0].as_str().unwrap().eq_ignore_ascii_case("authorization")
+                        && h[1] == "Bearer tok"
+                });
+                assert!(auth, "missing bearer on {url}");
+                log.lock()
+                    .unwrap()
+                    .push(format!("{} {url}", req["method"].as_str().unwrap()));
+                let path = url.trim_start_matches("http://abs.test");
+                let body = routes
+                    .iter()
+                    .find(|(p, _)| path == *p || path.starts_with(&format!("{p}?")))
+                    .map(|(_, b)| b.to_string());
+                let (status, body) = match body {
+                    Some(b) => (200, b),
+                    None => (404, "Not Found".to_string()),
+                };
+                Ok(json!({"status": status, "headers": [], "body": body.into_bytes()}).to_string())
+            }),
+            body,
+        );
+        let out = seen.lock().unwrap().clone();
+        out
     }
 
-    // ── Integration: AbsClient against a mock Audiobookshelf server ────────────
-    // Exercises the real HTTP path (Bearer auth + endpoint paths) and the full
-    // libraries→items→MediaUnit mapping without the endpoint db.
-    use wiremock::matchers::{header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    fn block<T>(f: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
 
-    #[tokio::test]
-    async fn units_maps_library_items_over_http() {
-        let server = MockServer::start().await;
-        let json = plugin_toolkit::serde_json::json!(
-        {"libraries": [
-            {"id": "lib_books", "mediaType": "book"},
-            {"id": "lib_pods",  "mediaType": "podcast"}
-        ]});
-        // /api/libraries — Bearer auth asserted.
-        Mock::given(method("GET"))
-            .and(path("/api/libraries"))
-            .and(header("authorization", "Bearer tok123"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json))
-            .mount(&server)
-            .await;
-        // Only the book library's items should be fetched for Audiobooks.
-        Mock::given(method("GET"))
-            .and(path("/api/libraries/lib_books/items"))
-            .and(header("authorization", "Bearer tok123"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                plugin_toolkit::serde_json::json!({"results": [{
-                    "id": "li_wok",
-                    "media": {"metadata": {
-                        "title": "The Way of Kings",
-                        "asin": "B0041JKFJW",
-                        "isbn": "0-7653-2635-5",
-                        "seriesName": "The Stormlight Archive"
-                    }}
-                }]}),
-            ))
-            .mount(&server)
-            .await;
+    fn abs() -> api::Abs {
+        api::Abs::new("http://abs.test/", "tok", false).unwrap()
+    }
 
-        let cfg = AbsConfig {
-            base_url: server.uri(),
-            token: "tok123".into(),
-        };
-        let units = AbsClient::new(&cfg)
-            .units(MediaType::Audiobooks)
-            .await
-            .expect("units ok");
-
-        assert_eq!(units.len(), 1, "only the book library maps");
-        let u = &units[0];
-        assert_eq!(u.media_type, MediaType::Audiobooks);
-        assert_eq!(u.identity.title, "The Way of Kings");
-        assert_eq!(
-            u.identity.series.as_ref().map(|s| s.name.as_str()),
-            Some("The Stormlight Archive")
+    #[test]
+    fn units_map_book_library_items_over_delegated_http() {
+        let mut got = Vec::new();
+        let calls = serve(
+            vec![
+                (
+                    "/api/libraries",
+                    json!({"libraries": [
+                        {"id": "lib_books", "mediaType": "book", "provider": "audible"},
+                        {"id": "lib_pods", "mediaType": "podcast"}
+                    ]}),
+                ),
+                (
+                    "/api/libraries/lib_books/items",
+                    json!({"total": 1, "results": [{
+                        "id": "li_wok", "libraryId": "lib_books",
+                        "media": {"metadata": {
+                            "title": "The Way of Kings",
+                            "asin": "B0041JKFJW",
+                            "isbn": "0-7653-2635-5",
+                            "seriesName": "The Stormlight Archive #1"
+                        }}
+                    }]}),
+                ),
+            ],
+            || got = block(units(&abs(), MediaType::Audiobooks)).unwrap(),
         );
-        // ASIN normalized upper; ISBN-10 normalized to ISBN-13 by #409 helpers.
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[1].contains("limit=500"), "{calls:?}");
+        assert_eq!(got.len(), 1);
+        let u = &got[0];
+        assert_eq!(u.identity.title, "The Way of Kings");
+        let s = u.identity.series.as_ref().unwrap();
+        assert_eq!(s.name, "The Stormlight Archive");
+        assert_eq!(s.sequence.as_deref(), Some("1"));
         let ids: Vec<(&str, &str)> = u
             .identity
             .external_ids
             .iter()
             .map(|e| (e.source.as_str(), e.id.as_str()))
             .collect();
-        assert!(ids.contains(&("asin", "B0041JKFJW")), "ids={ids:?}");
-        assert!(ids.contains(&("isbn", "9780765326355")), "ids={ids:?}");
-        // AppStream source points at the item on this server.
-        let src = &u.sources[0];
-        assert_eq!(src.by, "audiobookshelf");
+        assert!(ids.contains(&("asin", "B0041JKFJW")), "{ids:?}");
+        assert!(ids.contains(&("isbn", "9780765326355")), "{ids:?}");
         assert_eq!(
-            src.url.as_deref(),
-            Some(&*format!("{}/item/li_wok", server.uri()))
+            u.sources[0].url.as_deref(),
+            Some("http://abs.test/item/li_wok")
         );
     }
 
-    #[tokio::test]
-    async fn units_are_empty_for_a_type_abs_does_not_serve() {
-        let server = MockServer::start().await;
-        // No mounts needed: movies short-circuits before any request.
-        let cfg = AbsConfig {
-            base_url: server.uri(),
-            token: "t".into(),
-        };
-        let units = AbsClient::new(&cfg).units(MediaType::Movies).await.unwrap();
-        assert!(units.is_empty());
+    #[test]
+    fn units_are_empty_for_a_type_abs_does_not_serve() {
+        let calls = serve(vec![], || {
+            assert!(block(units(&abs(), MediaType::Movies)).unwrap().is_empty())
+        });
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn http_errors_surface_with_status() {
+        serve(vec![], || {
+            let e = block(abs().libraries()).unwrap_err().to_string();
+            assert!(e.contains("HTTP 404"), "{e}");
+        });
+    }
+
+    #[test]
+    fn search_uses_asin_and_library_provider() {
+        let calls = serve(
+            vec![(
+                "/api/search/books",
+                json!([{"title": "Dune", "asin": "B002V1OF70", "series": [{"series": "Dune", "sequence": "1"}]}]),
+            )],
+            || {
+                let mut it = api::parse_item(
+                    &json!({"id": "li_1", "media": {"metadata": {"title": "Dune", "asin": "B002V1OF70"}}}),
+                    "lib",
+                );
+                it.authors = vec!["Frank Herbert".into()];
+                let r = block(abs().search_books(&it, "audible")).unwrap();
+                assert_eq!(r[0].series[0].name, "Dune");
+            },
+        );
+        assert!(calls[0].contains("provider=audible"), "{calls:?}");
+        assert!(calls[0].contains("title=B002V1OF70"), "{calls:?}");
+    }
+
+    #[test]
+    fn update_patches_item_media() {
+        let calls = serve(
+            vec![("/api/items/li_1/media", json!({"updated": true}))],
+            || {
+                let patch = api::MetadataPatch {
+                    title: Some("X".into()),
+                    ..Default::default()
+                };
+                assert!(block(abs().update_metadata("li_1", &patch)).unwrap());
+            },
+        );
+        assert_eq!(calls, vec!["PATCH http://abs.test/api/items/li_1/media"]);
     }
 }

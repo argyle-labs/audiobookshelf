@@ -8,6 +8,9 @@
 //! types here force-links its `#[orca_tool]` inventory so it survives linking.
 plugin_toolkit::instrument::bootstrap!();
 
+#[allow(unused_imports)]
+use audiobookshelf::tools as _;
+
 fn main() -> plugin_toolkit::anyhow::Result<()> {
     use plugin_toolkit::media::MediaType;
     plugin_toolkit::plugin::Plugin::named("audiobookshelf")
