@@ -282,6 +282,21 @@ mod tests {
     }
 
     #[test]
+    fn gaps_start_at_lowest_when_above_five() {
+        assert_eq!(run(&[Some("6"), Some("8")]).gaps, vec![r(7, 7)]);
+        assert_eq!(run(&[Some("5"), Some("6")]).gaps, vec![r(1, 4)]);
+    }
+
+    #[test]
+    fn numbers_from_one_thousand_are_ignored() {
+        assert_eq!(
+            run(&[Some("1"), Some("3"), Some("1000")]).gaps,
+            vec![r(2, 2)]
+        );
+        assert_eq!(run(&[Some("1"), Some("999")]).gaps, vec![r(2, 998)]);
+    }
+
+    #[test]
     fn year_like_numbers_do_not_explode_gaps() {
         let g = run(&[Some("1"), Some("2019")]);
         assert!(g.gaps.is_empty());

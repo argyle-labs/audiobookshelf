@@ -603,6 +603,8 @@ mod tests {
                     name: "abs".into(),
                     library_id: None,
                     findings_only: true,
+                    offset: 0,
+                    limit: None,
                 };
                 got = Some(block(tools::series_gaps(&abs(), &args)).unwrap());
             },
@@ -611,6 +613,8 @@ mod tests {
         assert_eq!(r.summary.series, 2);
         assert_eq!(r.summary.missing, 1);
         assert_eq!(r.series.len(), 1);
+        assert_eq!(r.matched, 1);
+        assert!(!r.truncated);
         assert_eq!(r.series[0].series_id, "ser_1");
         assert_eq!(r.series[0].gaps, vec![gaps::SeqRange { from: 2, to: 2 }]);
     }

@@ -399,16 +399,36 @@ pub struct GapsArgs {
     #[arg(long)]
     #[serde(default)]
     pub findings_only: bool,
+    /// Skip this many series (after findings_only) before returning. Default 0.
+    #[arg(long)]
+    #[serde(default)]
+    pub offset: usize,
+    /// Return at most this many series. Default 200, max 1000.
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
+const GAPS_DEFAULT: usize = 200;
+const GAPS_MAX: usize = 1000;
+
+pub fn gaps_limit(limit: Option<usize>) -> Result<usize> {
+    match limit.unwrap_or(GAPS_DEFAULT) {
+        n if n > GAPS_MAX => bail!("limit {n} exceeds the maximum of {GAPS_MAX}"),
+        n => Ok(n),
+    }
 }
 
 #[orca_struct]
 #[derive(Debug, Clone, PartialEq)]
 pub struct GapsReport {
     pub summary: GapsSummary,
+    pub matched: usize,
+    pub truncated: bool,
     pub series: Vec<SeriesGaps>,
 }
 
 pub async fn series_gaps(abs: &Abs, args: &GapsArgs) -> Result<GapsReport> {
+    let limit = gaps_limit(args.limit)?;
     let libs = book_libraries(abs, args.library_id.as_deref()).await?;
     let mut all = Vec::new();
     for lib in &libs {
@@ -427,9 +447,13 @@ pub async fn series_gaps(abs: &Abs, args: &GapsArgs) -> Result<GapsReport> {
     if args.findings_only {
         all.retain(SeriesGaps::has_findings);
     }
+    let matched = all.len();
+    let series: Vec<SeriesGaps> = all.into_iter().skip(args.offset).take(limit).collect();
     Ok(GapsReport {
         summary,
-        series: all,
+        matched,
+        truncated: args.offset.saturating_add(series.len()) < matched,
+        series,
     })
 }
 
@@ -497,6 +521,13 @@ mod tests {
         let mut a = args();
         a.authors = Some(vec!["A".into(), " ".into()]);
         assert!(build_patch(&a, &item()).is_err());
+    }
+
+    #[test]
+    fn gaps_limit_defaults_and_caps() {
+        assert_eq!(gaps_limit(None).unwrap(), 200);
+        assert_eq!(gaps_limit(Some(1000)).unwrap(), 1000);
+        assert!(gaps_limit(Some(1001)).is_err());
     }
 
     #[test]
