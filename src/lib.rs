@@ -72,6 +72,7 @@ impl ServiceBackend for AudiobookshelfBackend {
 
 pub mod api;
 pub mod audit;
+pub mod gaps;
 pub mod tools;
 
 use plugin_toolkit::clap;
@@ -573,5 +574,44 @@ mod tests {
         );
         assert!(format!("{e:#}").contains("audiobookshelf"), "{e:#}");
         assert_eq!(*caps.lock().unwrap(), vec!["secret.op"]);
+    }
+
+    #[test]
+    fn series_gaps_joins_series_ids_to_item_sequences() {
+        let mut got = None;
+        serve(
+            vec![
+                (
+                    "/api/libraries",
+                    json!({"libraries": [{"id": "lib", "mediaType": "book", "provider": "audible"}]}),
+                ),
+                (
+                    "/api/libraries/lib/series",
+                    json!({"total": 1, "results": [{"id": "ser_1", "name": "Bobiverse", "books": []}]}),
+                ),
+                (
+                    "/api/libraries/lib/items",
+                    json!({"total": 3, "results": [
+                        {"id": "li_1", "media": {"metadata": {"title": "A", "seriesName": "Bobiverse #1"}}},
+                        {"id": "li_3", "media": {"metadata": {"title": "C", "seriesName": "Bobiverse #3"}}},
+                        {"id": "li_x", "media": {"metadata": {"title": "X", "seriesName": "Solo #1"}}}
+                    ]}),
+                ),
+            ],
+            || {
+                let args = tools::GapsArgs {
+                    name: "abs".into(),
+                    library_id: None,
+                    findings_only: true,
+                };
+                got = Some(block(tools::series_gaps(&abs(), &args)).unwrap());
+            },
+        );
+        let r = got.unwrap();
+        assert_eq!(r.summary.series, 2);
+        assert_eq!(r.summary.missing, 1);
+        assert_eq!(r.series.len(), 1);
+        assert_eq!(r.series[0].series_id, "ser_1");
+        assert_eq!(r.series[0].gaps, vec![gaps::SeqRange { from: 2, to: 2 }]);
     }
 }

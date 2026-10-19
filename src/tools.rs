@@ -3,6 +3,8 @@ use plugin_toolkit::prelude::*;
 use crate::api::{Abs, Item, Library, MetadataPatch, NameOnly, Series, SeriesEntry};
 use crate::audit::{self, SeriesFinding};
 use crate::endpoint_db;
+use crate::gaps::{self, GapsSummary, SeriesGaps};
+use std::collections::BTreeMap;
 
 pub async fn connect(name: &str) -> Result<Abs> {
     let token = plugin_toolkit::secrets::resolve_scoped("audiobookshelf", name, "token")?;
@@ -385,6 +387,62 @@ async fn audiobookshelf_series_audit(args: AuditArgs, _ctx: &ToolCtx) -> Result<
     Ok(report)
 }
 
+#[orca_struct(args)]
+pub struct GapsArgs {
+    /// Registered audiobookshelf endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Library id. Omitted, every book library.
+    #[arg(long)]
+    pub library_id: Option<String>,
+    /// Only series with gaps, duplicates or unsequenced books.
+    #[arg(long)]
+    #[serde(default)]
+    pub findings_only: bool,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq)]
+pub struct GapsReport {
+    pub summary: GapsSummary,
+    pub series: Vec<SeriesGaps>,
+}
+
+pub async fn series_gaps(abs: &Abs, args: &GapsArgs) -> Result<GapsReport> {
+    let libs = book_libraries(abs, args.library_id.as_deref()).await?;
+    let mut all = Vec::new();
+    for lib in &libs {
+        let ids: BTreeMap<String, String> = abs
+            .series(&lib.id)
+            .await?
+            .into_iter()
+            .map(|s| (s.name, s.id))
+            .collect();
+        for ((library_id, name), books) in gaps::group(&abs.items(&lib.id).await?) {
+            let id = ids.get(&name).cloned().unwrap_or_default();
+            all.push(gaps::analyze(&id, &name, &library_id, books));
+        }
+    }
+    let summary = gaps::summarize(libs.len(), &all);
+    if args.findings_only {
+        all.retain(SeriesGaps::has_findings);
+    }
+    Ok(GapsReport {
+        summary,
+        series: all,
+    })
+}
+
+/// Read-only sequence audit per series: missing integer sequences between 1
+/// (or the lowest, when past 5) and the highest, duplicate sequences, books
+/// with no sequence, and range sequences (`1-3`) as omnibus editions that
+/// cover their span. Decimal sequences are novellas, never gaps.
+#[orca_tool(domain = "audiobookshelf", verb = "series.gaps", role = "read")]
+async fn audiobookshelf_series_gaps(args: GapsArgs, _ctx: &ToolCtx) -> Result<GapsReport> {
+    let abs = connect(&args.name).await?;
+    series_gaps(&abs, &args).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +533,7 @@ mod tests {
             "audiobookshelf.items.list",
             "audiobookshelf.series.list",
             "audiobookshelf.series.audit",
+            "audiobookshelf.series.gaps",
         ] {
             assert_eq!(role(n), Some("read"), "{n}");
         }
