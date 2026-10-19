@@ -615,7 +615,54 @@ mod tests {
         assert_eq!(r.series.len(), 1);
         assert_eq!(r.matched, 1);
         assert!(!r.truncated);
-        assert_eq!(r.series[0].series_id, "ser_1");
+        assert_eq!(r.series[0].series_id.as_deref(), Some("ser_1"));
+        assert!(!r.series[0].unresolved_series);
         assert_eq!(r.series[0].gaps, vec![gaps::SeqRange { from: 2, to: 2 }]);
+    }
+
+    #[test]
+    fn series_gaps_prefers_item_series_id_and_flags_unresolved() {
+        let mut got = None;
+        serve(
+            vec![
+                (
+                    "/api/libraries",
+                    json!({"libraries": [{"id": "lib", "mediaType": "book", "provider": "audible"}]}),
+                ),
+                (
+                    "/api/libraries/lib/series",
+                    json!({"total": 1, "results": [{"id": "", "name": "Solo", "books": []}]}),
+                ),
+                (
+                    "/api/libraries/lib/items",
+                    json!({"total": 2, "results": [
+                        {"id": "li_1", "media": {"metadata": {"title": "A", "series": [{"id": "ser_b", "name": "Bobiverse", "sequence": "1"}]}}},
+                        {"id": "li_x", "media": {"metadata": {"title": "X", "seriesName": "Solo #1"}}}
+                    ]}),
+                ),
+            ],
+            || {
+                let args = tools::GapsArgs {
+                    name: "abs".into(),
+                    library_id: None,
+                    findings_only: false,
+                    offset: 0,
+                    limit: None,
+                };
+                got = Some(block(tools::series_gaps(&abs(), &args)).unwrap());
+            },
+        );
+        let r = got.unwrap();
+        assert_eq!(r.series.len(), 2);
+        assert_eq!(r.series[0].name, "Bobiverse");
+        assert_eq!(r.series[0].series_id.as_deref(), Some("ser_b"));
+        assert!(!r.series[0].unresolved_series);
+        assert_eq!(r.series[1].name, "Solo");
+        assert_eq!(r.series[1].series_id, None);
+        assert!(r.series[1].unresolved_series);
+        let v = serde_json::to_value(&r.series[1]).unwrap();
+        assert_eq!(v["series_id"], serde_json::Value::Null);
+        assert_eq!(v["unresolved_series"], true);
+        assert!(v.as_object().unwrap().contains_key("series_id"));
     }
 }

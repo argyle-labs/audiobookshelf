@@ -172,6 +172,7 @@ pub fn build_patch(args: &UpdateArgs, before: &Item) -> Result<MetadataPatch> {
     } else {
         args.series.as_ref().map(|name| {
             vec![SeriesEntry {
+                id: None,
                 name: name.trim().to_string(),
                 sequence: args.sequence.as_ref().map(|s| s.trim().to_string()),
             }]
@@ -438,9 +439,9 @@ pub async fn series_gaps(abs: &Abs, args: &GapsArgs) -> Result<GapsReport> {
             .into_iter()
             .map(|s| (s.name, s.id))
             .collect();
-        for ((library_id, name), books) in gaps::group(&abs.items(&lib.id).await?) {
-            let id = ids.get(&name).cloned().unwrap_or_default();
-            all.push(gaps::analyze(&id, &name, &library_id, books));
+        for ((library_id, name), (item_id, books)) in gaps::group(&abs.items(&lib.id).await?) {
+            let id = item_id.or_else(|| ids.get(&name).filter(|id| !id.trim().is_empty()).cloned());
+            all.push(gaps::analyze(id.as_deref(), &name, &library_id, books));
         }
     }
     let summary = gaps::summarize(libs.len(), &all);
@@ -481,6 +482,7 @@ mod tests {
             authors: vec!["Frank Herbert".into()],
             narrators: Vec::new(),
             series: vec![SeriesEntry {
+                id: None,
                 name: "Dune".into(),
                 sequence: Some("1".into()),
             }],

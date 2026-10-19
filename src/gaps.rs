@@ -24,7 +24,8 @@ pub struct BookRef {
 #[orca_struct]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeriesGaps {
-    pub series_id: String,
+    pub series_id: Option<String>,
+    pub unresolved_series: bool,
     pub name: String,
     pub library_id: String,
     pub books: Vec<BookRef>,
@@ -96,7 +97,7 @@ fn seq_order(s: &Seq) -> (u8, f64) {
 }
 
 pub fn analyze(
-    series_id: &str,
+    series_id: Option<&str>,
     name: &str,
     library_id: &str,
     mut books: Vec<BookRef>,
@@ -162,7 +163,8 @@ pub fn analyze(
         .cloned()
         .collect();
     SeriesGaps {
-        series_id: series_id.to_string(),
+        series_id: series_id.map(String::from),
+        unresolved_series: series_id.is_none(),
         name: name.to_string(),
         library_id: library_id.to_string(),
         books,
@@ -174,17 +176,23 @@ pub fn analyze(
     }
 }
 
-pub fn group(items: &[Item]) -> BTreeMap<(String, String), Vec<BookRef>> {
-    let mut out: BTreeMap<(String, String), Vec<BookRef>> = BTreeMap::new();
+pub type Grouped = BTreeMap<(String, String), (Option<String>, Vec<BookRef>)>;
+
+pub fn group(items: &[Item]) -> Grouped {
+    let mut out: Grouped = BTreeMap::new();
     for item in items {
         for s in &item.series {
-            out.entry((item.library_id.clone(), s.name.clone()))
-                .or_default()
-                .push(BookRef {
-                    item_id: item.id.clone(),
-                    title: item.title.clone(),
-                    sequence: s.sequence.clone(),
-                });
+            let entry = out
+                .entry((item.library_id.clone(), s.name.clone()))
+                .or_default();
+            if entry.0.is_none() {
+                entry.0 = s.id.clone().filter(|id| !id.trim().is_empty());
+            }
+            entry.1.push(BookRef {
+                item_id: item.id.clone(),
+                title: item.title.clone(),
+                sequence: s.sequence.clone(),
+            });
         }
     }
     out
@@ -222,7 +230,7 @@ mod tests {
                 sequence: s.map(String::from),
             })
             .collect();
-        analyze("s1", "S", "lib", books)
+        analyze(Some("s1"), "S", "lib", books)
     }
 
     fn r(from: i64, to: i64) -> SeqRange {

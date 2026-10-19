@@ -100,6 +100,7 @@ mod tests {
 
     fn s(name: &str, seq: Option<&str>) -> SeriesEntry {
         SeriesEntry {
+            id: None,
             name: name.into(),
             sequence: seq.map(String::from),
         }
