@@ -25,6 +25,8 @@ pub struct Library {
 #[orca_struct]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SeriesEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub name: String,
     pub sequence: Option<String>,
 }
@@ -346,10 +348,12 @@ pub fn parse_series_name(joined: &str) -> Vec<SeriesEntry> {
         .filter(|s| !s.is_empty())
         .map(|s| match s.rsplit_once(" #") {
             Some((name, seq)) if !seq.trim().is_empty() => SeriesEntry {
+                id: None,
                 name: name.trim().to_string(),
                 sequence: Some(seq.trim().to_string()),
             },
             _ => SeriesEntry {
+                id: None,
                 name: s.to_string(),
                 sequence: None,
             },
@@ -365,6 +369,7 @@ fn series_of(md: &Value) -> Vec<SeriesEntry> {
             .filter_map(|s| {
                 let name = opt_str(&s["name"]).or_else(|| opt_str(&s["series"]))?;
                 Some(SeriesEntry {
+                    id: opt_str(&s["id"]),
                     name,
                     sequence: opt_str(&s["sequence"]),
                 })
@@ -451,10 +456,12 @@ mod tests {
             it.series,
             vec![
                 SeriesEntry {
+                    id: None,
                     name: "The Stormlight Archive".into(),
                     sequence: Some("3".into())
                 },
                 SeriesEntry {
+                    id: None,
                     name: "Cosmere".into(),
                     sequence: Some("7.5".into())
                 },
